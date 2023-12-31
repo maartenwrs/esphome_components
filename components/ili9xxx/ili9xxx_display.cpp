@@ -52,7 +52,7 @@ void ILI9XXXDisplay::setup() {
   if (this->buffer_ != nullptr) {
     return;
   }
-  if (this->buffer_color_mode_ == BITS_16 && this->is_18bitdisplay_ == false) {
+  if (this->buffer_color_mode_ == BITS_16) {
     ESP_LOGCONFIG(TAG, "Low memory. Trying 8-bit color.");
     this->buffer_color_mode_ = BITS_8;
     this->init_internal_(this->get_buffer_length_());
@@ -219,89 +219,109 @@ void ILI9XXXDisplay::display_() {
   size_t w = this->x_high_ - this->x_low_ + 1;
   size_t const h = this->y_high_ - this->y_low_ + 1;
 
-  size_t mhz = this->data_rate_ / 1000000;
-  // estimate time for a single write
-  size_t sw_time = this->width_ * h * 16 / mhz + this->width_ * h * 2 / SPI_MAX_BLOCK_SIZE * SPI_SETUP_US * 2;
-  // estimate time for multiple writes
-  size_t mw_time = (w * h * 16) / mhz + w * h * 2 / ILI9XXX_TRANSFER_BUFFER_SIZE * SPI_SETUP_US;
+  // 3-bit mode starts on even pixels and ends on odd pixels per-row
   if (this->is_3bitdisplay_) {
-    w += (w&1); // make w even since 3-bit mode puts two pixels in one byte.
+    if (this->x_low_ & 1)		// decrement x_low_ if odd
+      this->x_low_--, w++;   
+    if (!(this->x_high_ & 1))		// increment x_high_ if even
+      this->x_high_++, w++;   
+    w += (w&1);				// increment w if odd
   }
+
   ESP_LOGV(TAG,
-           "Start display(xlow:%d, ylow:%d, xhigh:%d, yhigh:%d, width:%d, "
-           "height:%d, mode=%d, 18bit=%d, 3bit=%d, sw_time=%dus, mw_time=%dus)",
-           this->x_low_, this->y_low_, this->x_high_, this->y_high_, w, h, this->buffer_color_mode_,
-           this->is_18bitdisplay_, this->is_3bitdisplay, sw_time, mw_time);
+	"Start display(xlow:%d, ylow:%d, xhigh:%d, yhigh:%d, width:%d, "
+	"height:%d, mode=%d, 18bit=%d, 3bit=%d)", this->x_low_, this->y_low_,
+	this->x_high_, this->y_high_, w, h, this->buffer_color_mode_,
+	this->is_18bitdisplay_, this->is_3bitdisplay_);
+
   auto now = millis();
   this->enable();
-  if (this->buffer_color_mode_ == BITS_16 && !this->is_18bitdisplay_ && sw_time < mw_time) {
-    // 16 bit mode maps directly to display format
-    ESP_LOGV(TAG, "Doing single write of %d bytes", this->width_ * h * 2);
-    set_addr_window_(0, this->y_low_, this->width_ - 1, this->y_high_);
-    this->write_array(this->buffer_ + this->y_low_ * this->width_ * 2, h * this->width_ * 2);
-  } else {
-    ESP_LOGV(TAG, "Doing multiple write");
-    size_t rem = h * w;  // remaining number of pixels to write
-    set_addr_window_(this->x_low_, this->y_low_, this->x_high_, this->y_high_);
-    size_t idx = 0;    // index into transfer_buffer
-    size_t pixel = 0;  // pixel number offset
-    size_t pos = this->y_low_ * this->width_ + this->x_low_;
-    uint16_t color_val, color_val2;
-    while (rem-- != 0) {
-      if (this->is_3bitdisplay_) {
-	// convert two 332 pixels to one byte of two 3-bit pixels
-	color_val  = this->buffer_[pos++];	  // Pixel 1: 00BGR--- binary
-	color_val2 = this->buffer_[pos++];	  // Pixel 2: 00---BGR binary
-        transfer_buffer[idx++] = (uint8_t)	  // Color 332 BBBGGGRR bits
+
+  if (this->buffer_color_mode_ == BITS_16 && !this->is_18bitdisplay_) {
+    // estimate times for single vs multiple writes
+    size_t mhz = this->data_rate_ / 1000000;
+    size_t sw_time = this->width_ * h * 16 / mhz + this->width_ * h * 2 / SPI_MAX_BLOCK_SIZE * SPI_SETUP_US * 2;
+    size_t mw_time = (w * h * 16) / mhz + w * h * 2 / ILI9XXX_TRANSFER_BUFFER_SIZE * SPI_SETUP_US;
+
+    if (sw_time < mw_time) {
+      // 16 bit mode maps directly to display format
+      set_addr_window_(0, this->y_low_, this->width_ - 1, this->y_high_);
+      this->write_array(this->buffer_ + this->y_low_ * this->width_ * 2, h * this->width_ * 2);
+      this->disable();
+      ESP_LOGV(TAG, "Did single write of %d bytes in %dms."
+	" (sw_time = %dus, mw_time=%dus)",
+	this->width_ * h * 2, (unsigned) (millis() - now), sw_time, mw_time);
+      // all done. invalidate watermarks and bail
+      this->x_low_ = this->width_;
+      this->y_low_ = this->height_;
+      this->x_high_ = 0;
+      this->y_high_ = 0;
+      return;
+    }
+  }
+
+  size_t rem = h * w;  // remaining number of pixels to write
+  set_addr_window_(this->x_low_, this->y_low_, this->x_high_, this->y_high_);
+  size_t idx = 0;    // index into transfer_buffer
+  size_t pixel = 0;  // pixel number offset
+  size_t pos = this->y_low_ * this->width_ + this->x_low_;
+  uint16_t color_val, color_val2;
+  while (rem-- != 0) {
+    if (this->is_3bitdisplay_) {
+      // convert two 332 pixels to one byte of two 3-bit pixels
+      color_val  = this->buffer_[pos++];	  // Pixel 1: 00BGR--- binary
+      color_val2 = this->buffer_[pos++];	  // Pixel 2: 00---BGR binary
+      transfer_buffer[idx++] = (uint8_t)	  // Color 332 BBBGGGRR bits
 		((color_val  & 0x80) >> 2)	| // bit 7 becomes P1 B bit 5
 		((color_val  & 0x10)     )	| // bit 4 becomes P1 G bit 4
 		((color_val  & 0x02) << 2)	| // bit 1 becomes P1 R bit 3
 		((color_val2 & 0x80) >> 5)	| // bit 7 becomes P2 B bit 2
 		((color_val2 & 0x10) >> 3)	| // bit 4 becomes P2 G bit 1
 		((color_val2 & 0x02) >> 1);	  // bit 1 becomes P2 R bit 0
-	rem --;		// bump for extra pixel processed
-	pixel ++;	// bump for extra pixel processed
-      } else {
-        switch (this->buffer_color_mode_) {
-          case BITS_16:
-            color_val = (buffer_[pos * 2] << 8) + buffer_[pos * 2 + 1];
-            pos++;
-            break;
-          case BITS_8_INDEXED:
-            color_val = display::ColorUtil::color_to_565(
+      rem --;		// bump for extra pixel processed
+      pixel ++;	// bump for extra pixel processed
+    } else {
+      switch (this->buffer_color_mode_) {
+        case BITS_16:
+          color_val = (buffer_[pos * 2] << 8) + buffer_[pos * 2 + 1];
+          pos++;
+          break;
+        case BITS_8_INDEXED:
+          color_val = display::ColorUtil::color_to_565(
                 display::ColorUtil::index8_to_color_palette888(this->buffer_[pos++], this->palette_));
-            break;
-          default:  // case BITS_8:
-            color_val = display::ColorUtil::color_to_565(display::ColorUtil::rgb332_to_color(this->buffer_[pos++]));
-            break;
-        }
-        if (this->is_18bitdisplay_) {
-          transfer_buffer[idx++] = (uint8_t) ((color_val & 0xF800) >> 8);  // Blue
-          transfer_buffer[idx++] = (uint8_t) ((color_val & 0x7E0) >> 3);   // Green
-          transfer_buffer[idx++] = (uint8_t) (color_val << 3);             // Red
-        } else {
-          put16_be(transfer_buffer + idx, color_val);
-          idx += 2;
-        }
+          break;
+        default:  // case BITS_8:
+          color_val = display::ColorUtil::color_to_565(display::ColorUtil::rgb332_to_color(this->buffer_[pos++]));
+          break;
       }
-      if (idx == ILI9XXX_TRANSFER_BUFFER_SIZE) {
-        this->write_array(transfer_buffer, idx);
-        idx = 0;
-        App.feed_wdt();
-      }
-      // end of line? Skip to the next.
-      if (++pixel >= w) {
-        pixel = 0;
-        pos += this->width_ - w;
+      if (this->is_18bitdisplay_) {
+        transfer_buffer[idx++] = (uint8_t) ((color_val & 0xF800) >> 8);  // B
+        transfer_buffer[idx++] = (uint8_t) ((color_val & 0x7E0) >> 3);   // G
+        transfer_buffer[idx++] = (uint8_t) (color_val << 3);             // R
+      } else {
+        put16_be(transfer_buffer + idx, color_val);
+        idx += 2;
       }
     }
-    // flush any balance.
-    if (idx != 0) {
+    if (idx == ILI9XXX_TRANSFER_BUFFER_SIZE) {
       this->write_array(transfer_buffer, idx);
+      idx = 0;
+      App.feed_wdt();
+    }
+    // end of line? Skip to the next.
+    if (++pixel >= w) {
+      pixel = 0;
+      pos += this->width_ - w;
     }
   }
+  // flush any balance.
+  if (idx != 0) {
+    this->write_array(transfer_buffer, idx);
+  }
+
   this->disable();
-  ESP_LOGV(TAG, "Data write took %dms", (unsigned) (millis() - now));
+  ESP_LOGV(TAG, "Did multi write in %dms", (unsigned) (millis() - now));
+ 
   // invalidate watermarks
   this->x_low_ = this->width_;
   this->y_low_ = this->height_;
