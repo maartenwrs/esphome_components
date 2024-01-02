@@ -124,7 +124,6 @@ class ILI9XXXDisplay : public display::DisplayBuffer,
   bool prossing_update_ = false;
   bool need_update_ = false;
   bool is_18bitdisplay_ = false;
-  bool is_3bitdisplay_ = false;
   bool pre_invertcolors_ = false;
   display::ColorOrder color_order_{};
   bool swap_xy_{};
